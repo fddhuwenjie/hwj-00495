@@ -1543,20 +1543,35 @@ def main():
         sys.exit(1 if errors_only else 0)
 
     if args.command == 'ast':
+        all_errors = []
+        for pe in parse_errors:
+            all_errors.append(TypeCheckError(pe.message, pe.line, pe.col, "error"))
+        all_errors.extend(type_errors)
+
         if args.json:
-            print(json.dumps(ast.to_dict(), indent=2, ensure_ascii=False))
+            diagnostics = []
+            for e in all_errors:
+                diagnostics.append({
+                    "severity": e.severity,
+                    "message": e.message,
+                    "line": e.line,
+                    "col": e.col,
+                })
+            output = {
+                "ast": ast.to_dict(),
+                "diagnostics": diagnostics,
+                "has_errors": any(e.severity == "error" for e in all_errors),
+                "has_warnings": any(e.severity == "warning" for e in all_errors),
+            }
+            print(json.dumps(output, indent=2, ensure_ascii=False))
         else:
             print("=" * 60)
             print("Typed Abstract Syntax Tree")
             print("=" * 60)
             print(format_ast_tree(ast))
-        all_errors = []
-        for pe in parse_errors:
-            all_errors.append(TypeCheckError(pe.message, pe.line, pe.col, "error"))
-        all_errors.extend(type_errors)
-        if all_errors:
-            print()
-            print(format_errors(all_errors, "Diagnostics"))
+            if all_errors:
+                print()
+                print(format_errors(all_errors, "Diagnostics"))
         sys.exit(1 if any(e.severity == 'error' for e in all_errors) else 0)
 
 
