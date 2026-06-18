@@ -1869,13 +1869,17 @@ class IROptimizer:
 
     def optimize(self, func_ir: FunctionIR) -> Tuple[List[IRInst], List[BasicBlock]]:
         insts = list(func_ir.instructions)
-        insts = self._constant_folding(insts)
-        insts = self._eliminate_dead_code(insts)
 
-        temp_func = FunctionIR(name=func_ir.name, instructions=insts)
         cfg_builder = CFGBuilder()
+        temp_func = FunctionIR(name=func_ir.name, instructions=insts)
         blocks = cfg_builder.build(temp_func)
-        return insts, blocks
+
+        insts = self._conservative_constant_propagation(insts, blocks)
+        insts = self._cfg_based_dead_code_elimination(insts, blocks)
+
+        temp_func2 = FunctionIR(name=func_ir.name, instructions=insts)
+        final_blocks = cfg_builder.build(temp_func2)
+        return insts, final_blocks
 
     def _is_literal(self, val: Optional[str]) -> bool:
         if val is None:
@@ -1960,130 +1964,282 @@ class IROptimizer:
             return None
         return inst.result
 
-    def _constant_folding(self, insts: List[IRInst]) -> List[IRInst]:
-        const_map: Dict[str, Any] = {}
-        result = []
+    def _get_modified_vars(self, inst: IRInst) -> set:
+        modified = set()
+        defn = self._get_def(inst)
+        if defn:
+            modified.add(defn)
+        if inst.op == IROp.ARRAY_STORE:
+            modified.add(inst.arg1)
+        return modified
+
+    def _find_loop_headers(self, blocks: List[BasicBlock]) -> set:
+        headers = set()
+        for bb in blocks:
+            for succ in bb.successors:
+                if succ <= bb.id:
+                    headers.add(succ)
+        return headers
+
+    def _conservative_constant_propagation(self, insts: List[IRInst], blocks: List[BasicBlock]) -> List[IRInst]:
         arith_ops = {IROp.ADD, IROp.SUB, IROp.MUL, IROp.DIV, IROp.MOD}
         cmp_ops = {IROp.EQ, IROp.NEQ, IROp.LT, IROp.GT, IROp.LE, IROp.GE}
         logic_ops = {IROp.AND, IROp.OR}
 
-        def resolve(val: Optional[str]) -> Optional[Any]:
-            if val is None:
-                return None
-            if val in const_map:
-                return const_map[val]
-            if self._is_literal(val):
-                return self._parse_literal(val)
-            return None
+        loop_headers = self._find_loop_headers(blocks)
 
-        for inst in insts:
+        block_start_idx = {}
+        block_end_idx = {}
+        inst_idx = 0
+        for bb in blocks:
+            block_start_idx[bb.id] = inst_idx
+            inst_idx += len(bb.instructions)
+            block_end_idx[bb.id] = inst_idx - 1
+
+        block_of_inst = [0] * len(insts)
+        for bb in blocks:
+            for i in range(block_start_idx[bb.id], block_end_idx[bb.id] + 1):
+                if i < len(block_of_inst):
+                    block_of_inst[i] = bb.id
+
+        unreliable_vars: set = set()
+
+        for bb in blocks:
+            if bb.id in loop_headers:
+                worklist = [bb.id]
+                visited = set()
+                while worklist:
+                    curr = worklist.pop()
+                    if curr in visited:
+                        continue
+                    visited.add(curr)
+                    for i in range(block_start_idx[curr], block_end_idx[curr] + 1):
+                        if i < len(insts):
+                            for v in self._get_modified_vars(insts[i]):
+                                unreliable_vars.add(v)
+                    for s in blocks[curr].successors:
+                        if s >= bb.id and s not in visited:
+                            worklist.append(s)
+
+        for i, inst in enumerate(insts):
+            if inst.op == IROp.ARRAY_STORE or inst.op == IROp.ARRAY_LOAD:
+                for v in self._get_uses(inst):
+                    unreliable_vars.add(v)
+                for v in self._get_modified_vars(inst):
+                    unreliable_vars.add(v)
+
+            if inst.op == IROp.CALL:
+                for v in self._get_uses(inst):
+                    unreliable_vars.add(v)
+                for bb in blocks:
+                    for v in self._get_modified_vars(insts[i]):
+                        unreliable_vars.add(v)
+
+            if inst.op == IROp.ASSIGN:
+                defn = self._get_def(inst)
+                if defn and defn in unreliable_vars:
+                    pass
+                elif defn and not self._is_literal(inst.arg1):
+                    pass
+
+        const_map: Dict[str, Any] = {}
+        result = []
+        current_block = 0
+        is_in_loop = False
+
+        for i, inst in enumerate(insts):
+            if i < len(block_of_inst):
+                new_block = block_of_inst[i]
+                if new_block != current_block:
+                    current_block = new_block
+                    if blocks[current_block].id in loop_headers:
+                        is_in_loop = True
+
+            if blocks[current_block].id in loop_headers and inst.op == IROp.LABEL:
+                for v in list(const_map.keys()):
+                    if v in unreliable_vars:
+                        del const_map[v]
+                    elif not v.startswith('t'):
+                        if v in unreliable_vars:
+                            del const_map[v]
+
             new_inst = IRInst(inst.op, inst.result, inst.arg1, inst.arg2, inst.extra)
             folded = False
 
-            r1 = resolve(new_inst.arg1)
-            if r1 is not None and new_inst.op not in (IROp.LABEL,):
-                new_inst.arg1 = self._literal_to_str(r1)
-            r2 = resolve(new_inst.arg2)
-            if r2 is not None:
-                new_inst.arg2 = self._literal_to_str(r2)
-            if new_inst.extra and isinstance(new_inst.extra, list):
-                new_extra = []
-                for a in new_inst.extra:
-                    ra = resolve(a)
-                    new_extra.append(self._literal_to_str(ra) if ra is not None else a)
-                new_inst.extra = new_extra
+            def resolve(val: Optional[str]) -> Optional[Any]:
+                if val is None:
+                    return None
+                if val in unreliable_vars:
+                    return None
+                if val in const_map:
+                    return const_map[val]
+                if self._is_literal(val):
+                    return self._parse_literal(val)
+                return None
+
+            if not is_in_loop or (new_inst.op not in (IROp.JUMP_IF, IROp.JUMP_IF_NOT)):
+                r1 = resolve(new_inst.arg1)
+                if r1 is not None and new_inst.op not in (IROp.LABEL,):
+                    new_inst.arg1 = self._literal_to_str(r1)
+                r2 = resolve(new_inst.arg2)
+                if r2 is not None:
+                    new_inst.arg2 = self._literal_to_str(r2)
+                if new_inst.extra and isinstance(new_inst.extra, list):
+                    new_extra = []
+                    for a in new_inst.extra:
+                        ra = resolve(a)
+                        new_extra.append(self._literal_to_str(ra) if ra is not None else a)
+                    new_inst.extra = new_extra
 
             defn = self._get_def(new_inst)
 
-            if new_inst.op in arith_ops and defn and self._is_literal(new_inst.arg1) and self._is_literal(new_inst.arg2):
-                v1 = self._parse_literal(new_inst.arg1)
-                v2 = self._parse_literal(new_inst.arg2)
-                op_map = {IROp.ADD: lambda a, b: a + b, IROp.SUB: lambda a, b: a - b,
-                          IROp.MUL: lambda a, b: a * b, IROp.DIV: lambda a, b: a / b,
-                          IROp.MOD: lambda a, b: a % b}
-                try:
-                    folded_val = op_map[new_inst.op](v1, v2)
-                    const_map[defn] = folded_val
-                    new_inst = IRInst(IROp.ASSIGN, result=defn, arg1=self._literal_to_str(folded_val))
-                    folded = True
-                except (TypeError, ZeroDivisionError):
-                    pass
+            if defn and defn in unreliable_vars:
+                result.append(new_inst)
+                if defn in const_map:
+                    del const_map[defn]
+                continue
 
-            if not folded and new_inst.op in cmp_ops and defn and self._is_literal(new_inst.arg1) and self._is_literal(new_inst.arg2):
-                v1 = self._parse_literal(new_inst.arg1)
-                v2 = self._parse_literal(new_inst.arg2)
-                op_map = {IROp.EQ: lambda a, b: a == b, IROp.NEQ: lambda a, b: a != b,
-                          IROp.LT: lambda a, b: a < b, IROp.GT: lambda a, b: a > b,
-                          IROp.LE: lambda a, b: a <= b, IROp.GE: lambda a, b: a >= b}
-                try:
-                    folded_val = op_map[new_inst.op](v1, v2)
-                    const_map[defn] = folded_val
-                    new_inst = IRInst(IROp.ASSIGN, result=defn, arg1=self._literal_to_str(folded_val))
-                    folded = True
-                except TypeError:
-                    pass
+            can_fold = True
+            if defn and not defn.startswith('t'):
+                if new_inst.op == IROp.ASSIGN and self._is_literal(new_inst.arg1):
+                    if defn in unreliable_vars:
+                        can_fold = False
+                else:
+                    if defn in unreliable_vars:
+                        can_fold = False
 
-            if not folded and new_inst.op in logic_ops and defn and self._is_literal(new_inst.arg1) and self._is_literal(new_inst.arg2):
-                v1 = self._parse_literal(new_inst.arg1)
-                v2 = self._parse_literal(new_inst.arg2)
-                op_map = {IROp.AND: lambda a, b: a and b, IROp.OR: lambda a, b: a or b}
-                try:
-                    folded_val = op_map[new_inst.op](v1, v2)
-                    const_map[defn] = folded_val
-                    new_inst = IRInst(IROp.ASSIGN, result=defn, arg1=self._literal_to_str(folded_val))
-                    folded = True
-                except TypeError:
-                    pass
+            if can_fold and defn and defn.startswith('t') and not is_in_loop:
+                if new_inst.op in arith_ops and self._is_literal(new_inst.arg1) and self._is_literal(new_inst.arg2):
+                    v1 = self._parse_literal(new_inst.arg1)
+                    v2 = self._parse_literal(new_inst.arg2)
+                    op_map = {IROp.ADD: lambda a, b: a + b, IROp.SUB: lambda a, b: a - b,
+                              IROp.MUL: lambda a, b: a * b, IROp.DIV: lambda a, b: a / b,
+                              IROp.MOD: lambda a, b: a % b}
+                    try:
+                        folded_val = op_map[new_inst.op](v1, v2)
+                        const_map[defn] = folded_val
+                        new_inst = IRInst(IROp.ASSIGN, result=defn, arg1=self._literal_to_str(folded_val))
+                        folded = True
+                    except (TypeError, ZeroDivisionError):
+                        pass
 
-            if not folded and new_inst.op == IROp.NOT and defn and self._is_literal(new_inst.arg1):
-                v = self._parse_literal(new_inst.arg1)
-                if isinstance(v, bool):
-                    folded_val = not v
-                    const_map[defn] = folded_val
-                    new_inst = IRInst(IROp.ASSIGN, result=defn, arg1=self._literal_to_str(folded_val))
-                    folded = True
+                if not folded and new_inst.op in cmp_ops and self._is_literal(new_inst.arg1) and self._is_literal(new_inst.arg2):
+                    v1 = self._parse_literal(new_inst.arg1)
+                    v2 = self._parse_literal(new_inst.arg2)
+                    op_map = {IROp.EQ: lambda a, b: a == b, IROp.NEQ: lambda a, b: a != b,
+                              IROp.LT: lambda a, b: a < b, IROp.GT: lambda a, b: a > b,
+                              IROp.LE: lambda a, b: a <= b, IROp.GE: lambda a, b: a >= b}
+                    try:
+                        folded_val = op_map[new_inst.op](v1, v2)
+                        const_map[defn] = folded_val
+                        new_inst = IRInst(IROp.ASSIGN, result=defn, arg1=self._literal_to_str(folded_val))
+                        folded = True
+                    except TypeError:
+                        pass
 
-            if not folded and new_inst.op == IROp.NEG and defn and self._is_literal(new_inst.arg1):
-                v = self._parse_literal(new_inst.arg1)
-                if isinstance(v, (int, float)):
-                    folded_val = -v
-                    const_map[defn] = folded_val
-                    new_inst = IRInst(IROp.ASSIGN, result=defn, arg1=self._literal_to_str(folded_val))
-                    folded = True
+                if not folded and new_inst.op in logic_ops and self._is_literal(new_inst.arg1) and self._is_literal(new_inst.arg2):
+                    v1 = self._parse_literal(new_inst.arg1)
+                    v2 = self._parse_literal(new_inst.arg2)
+                    op_map = {IROp.AND: lambda a, b: a and b, IROp.OR: lambda a, b: a or b}
+                    try:
+                        folded_val = op_map[new_inst.op](v1, v2)
+                        const_map[defn] = folded_val
+                        new_inst = IRInst(IROp.ASSIGN, result=defn, arg1=self._literal_to_str(folded_val))
+                        folded = True
+                    except TypeError:
+                        pass
 
-            if not folded and new_inst.op == IROp.ASSIGN and defn and self._is_literal(new_inst.arg1):
-                const_map[defn] = self._parse_literal(new_inst.arg1)
+                if not folded and new_inst.op == IROp.NOT and self._is_literal(new_inst.arg1):
+                    v = self._parse_literal(new_inst.arg1)
+                    if isinstance(v, bool):
+                        folded_val = not v
+                        const_map[defn] = folded_val
+                        new_inst = IRInst(IROp.ASSIGN, result=defn, arg1=self._literal_to_str(folded_val))
+                        folded = True
+
+                if not folded and new_inst.op == IROp.NEG and self._is_literal(new_inst.arg1):
+                    v = self._parse_literal(new_inst.arg1)
+                    if isinstance(v, (int, float)):
+                        folded_val = -v
+                        const_map[defn] = folded_val
+                        new_inst = IRInst(IROp.ASSIGN, result=defn, arg1=self._literal_to_str(folded_val))
+                        folded = True
+
+            if not folded and new_inst.op == IROp.ASSIGN and defn and defn.startswith('t') and self._is_literal(new_inst.arg1):
+                if defn not in unreliable_vars and not is_in_loop:
+                    const_map[defn] = self._parse_literal(new_inst.arg1)
+
+            if defn and not defn.startswith('t'):
+                if defn in const_map:
+                    del const_map[defn]
+                if new_inst.op == IROp.ASSIGN and self._is_literal(new_inst.arg1):
+                    if defn not in unreliable_vars and not is_in_loop:
+                        const_map[defn] = self._parse_literal(new_inst.arg1)
 
             result.append(new_inst)
         return result
 
-    def _eliminate_dead_code(self, insts: List[IRInst]) -> List[IRInst]:
-        used: set = set()
-        changed = True
-        while changed:
-            changed = False
-            for inst in reversed(insts):
-                defn = self._get_def(inst)
-                if defn and defn in used:
-                    for u in self._get_uses(inst):
-                        if u not in used:
-                            used.add(u)
-                            changed = True
-                elif inst.op in self.SIDE_EFFECT_OPS:
-                    for u in self._get_uses(inst):
-                        if u not in used:
-                            used.add(u)
-                            changed = True
+    def _cfg_based_dead_code_elimination(self, insts: List[IRInst], blocks: List[BasicBlock]) -> List[IRInst]:
+        live_in: List[set] = [set() for _ in blocks]
+        live_out: List[set] = [set() for _ in blocks]
 
-        result = []
-        for inst in insts:
-            if inst.op in self.SIDE_EFFECT_OPS:
-                result.append(inst)
-                continue
-            defn = self._get_def(inst)
-            if defn and defn in used:
-                result.append(inst)
-        return result
+        block_uses: List[set] = [set() for _ in blocks]
+        block_defs: List[set] = [set() for _ in blocks]
+
+        for bb in blocks:
+            local_defs = set()
+            for inst in bb.instructions:
+                for u in self._get_uses(inst):
+                    if u not in local_defs:
+                        block_uses[bb.id].add(u)
+                d = self._get_def(inst)
+                if d:
+                    local_defs.add(d)
+            block_defs[bb.id] = local_defs
+
+        changed = True
+        iterations = 0
+        while changed and iterations < 1000:
+            changed = False
+            iterations += 1
+            for bb in reversed(blocks):
+                new_live_out = set()
+                for succ in bb.successors:
+                    new_live_out |= live_in[succ]
+                if new_live_out != live_out[bb.id]:
+                    live_out[bb.id] = new_live_out
+                    changed = True
+
+                new_live_in = block_uses[bb.id] | (live_out[bb.id] - block_defs[bb.id])
+                if new_live_in != live_in[bb.id]:
+                    live_in[bb.id] = new_live_in
+                    changed = True
+
+        final_result = []
+        for bb in blocks:
+            live = set(live_out[bb.id])
+            block_result = []
+            for inst in reversed(bb.instructions):
+                keep = False
+                inst_def = self._get_def(inst)
+
+                if inst.op in self.SIDE_EFFECT_OPS:
+                    keep = True
+                elif inst_def and inst_def in live:
+                    keep = True
+                elif inst_def and not inst_def.startswith('t'):
+                    keep = True
+
+                if keep:
+                    for u in self._get_uses(inst):
+                        live.add(u)
+                    if inst_def:
+                        live.discard(inst_def)
+                    block_result.append(inst)
+
+            block_result.reverse()
+            final_result.extend(block_result)
+        return final_result
 
 
 def format_token_table(tokens: List[Token]) -> str:
