@@ -361,6 +361,134 @@ class ASTNodeType(Enum):
     IDENTIFIER = auto()
 
 
+class IROp(Enum):
+    ASSIGN = "assign"
+    ADD = "add"
+    SUB = "sub"
+    MUL = "mul"
+    DIV = "div"
+    MOD = "mod"
+    EQ = "eq"
+    NEQ = "neq"
+    LT = "lt"
+    GT = "gt"
+    LE = "le"
+    GE = "ge"
+    AND = "and"
+    OR = "or"
+    NOT = "not"
+    NEG = "neg"
+    ARRAY_LOAD = "array_load"
+    ARRAY_STORE = "array_store"
+    CALL = "call"
+    RETURN = "return"
+    PRINT = "print"
+    LABEL = "label"
+    JUMP = "jump"
+    JUMP_IF = "jump_if"
+    JUMP_IF_NOT = "jump_if_not"
+    PARAM = "param"
+
+
+@dataclass
+class IRInst:
+    op: IROp
+    result: Optional[str] = None
+    arg1: Optional[str] = None
+    arg2: Optional[str] = None
+    extra: Optional[Any] = None
+
+    def to_dict(self) -> Dict:
+        d = {"op": self.op.value}
+        if self.result is not None:
+            d["result"] = self.result
+        if self.arg1 is not None:
+            d["arg1"] = self.arg1
+        if self.arg2 is not None:
+            d["arg2"] = self.arg2
+        if self.extra is not None:
+            d["extra"] = self.extra
+        return d
+
+    def __str__(self) -> str:
+        op = self.op.value
+        if self.op == IROp.LABEL:
+            return f"{self.arg1}:"
+        elif self.op == IROp.JUMP:
+            return f"  jump {self.arg1}"
+        elif self.op == IROp.JUMP_IF:
+            return f"  jump_if {self.arg1} {self.arg2}"
+        elif self.op == IROp.JUMP_IF_NOT:
+            return f"  jump_if_not {self.arg1} {self.arg2}"
+        elif self.op == IROp.ASSIGN:
+            return f"  {self.result} = {self.arg1}"
+        elif self.op == IROp.ARRAY_LOAD:
+            return f"  {self.result} = {self.arg1}[{self.arg2}]"
+        elif self.op == IROp.ARRAY_STORE:
+            return f"  {self.arg1}[{self.arg2}] = {self.result}"
+        elif self.op in (IROp.ADD, IROp.SUB, IROp.MUL, IROp.DIV, IROp.MOD,
+                         IROp.EQ, IROp.NEQ, IROp.LT, IROp.GT, IROp.LE, IROp.GE,
+                         IROp.AND, IROp.OR):
+            op_map = {IROp.ADD: '+', IROp.SUB: '-', IROp.MUL: '*', IROp.DIV: '/', IROp.MOD: '%',
+                      IROp.EQ: '==', IROp.NEQ: '!=', IROp.LT: '<', IROp.GT: '>',
+                      IROp.LE: '<=', IROp.GE: '>=', IROp.AND: '&&', IROp.OR: '||'}
+            sym = op_map.get(self.op, op)
+            return f"  {self.result} = {self.arg1} {sym} {self.arg2}"
+        elif self.op in (IROp.NOT, IROp.NEG):
+            sym = '!' if self.op == IROp.NOT else '-'
+            return f"  {self.result} = {sym}{self.arg1}"
+        elif self.op == IROp.CALL:
+            args = self.extra if self.extra else []
+            return f"  {self.result} = call {self.arg1}({', '.join(args)})"
+        elif self.op == IROp.RETURN:
+            if self.arg1:
+                return f"  return {self.arg1}"
+            return f"  return"
+        elif self.op == IROp.PRINT:
+            return f"  print {self.arg1}"
+        elif self.op == IROp.PARAM:
+            return f"  param {self.arg1}"
+        return f"  {op} {self.result} {self.arg1} {self.arg2}"
+
+
+@dataclass
+class BasicBlock:
+    id: int
+    label: str
+    instructions: List[IRInst] = field(default_factory=list)
+    predecessors: List[int] = field(default_factory=list)
+    successors: List[int] = field(default_factory=list)
+    jump_condition: Optional[str] = None
+
+    def to_dict(self) -> Dict:
+        return {
+            "id": self.id,
+            "label": self.label,
+            "instructions": [inst.to_dict() for inst in self.instructions],
+            "predecessors": self.predecessors,
+            "successors": self.successors,
+            "jump_condition": self.jump_condition,
+        }
+
+
+@dataclass
+class FunctionIR:
+    name: str
+    instructions: List[IRInst] = field(default_factory=list)
+    basic_blocks: List[BasicBlock] = field(default_factory=list)
+    optimized_instructions: Optional[List[IRInst]] = None
+    optimized_basic_blocks: Optional[List[BasicBlock]] = None
+
+    def to_dict(self, optimized: bool = False) -> Dict:
+        insts = self.optimized_instructions if (optimized and self.optimized_instructions is not None) else self.instructions
+        blocks = self.optimized_basic_blocks if (optimized and self.optimized_basic_blocks is not None) else self.basic_blocks
+        return {
+            "name": self.name,
+            "instructions": [inst.to_dict() for inst in insts],
+            "basic_blocks": [bb.to_dict() for bb in blocks],
+        }
+
+
 @dataclass
 class SourcePos:
     line: int
@@ -1395,6 +1523,514 @@ class TypeChecker:
         result.append({"scope": name, "level": scope.level, "symbols": entries})
 
 
+class IRGenerator:
+    BIN_OP_MAP = {
+        '+': IROp.ADD, '-': IROp.SUB, '*': IROp.MUL, '/': IROp.DIV, '%': IROp.MOD,
+        '==': IROp.EQ, '!=': IROp.NEQ, '<': IROp.LT, '>': IROp.GT,
+        '<=': IROp.LE, '>=': IROp.GE, '&&': IROp.AND, '||': IROp.OR,
+    }
+
+    def __init__(self, ast: ASTNode):
+        self.ast = ast
+        self.temp_counter = 0
+        self.label_counter = 0
+        self.function_irs: Dict[str, FunctionIR] = {}
+        self.current_func: Optional[FunctionIR] = None
+
+    def new_temp(self) -> str:
+        self.temp_counter += 1
+        return f"t{self.temp_counter}"
+
+    def new_label(self, prefix: str = "L") -> str:
+        self.label_counter += 1
+        return f"{prefix}{self.label_counter}"
+
+    def emit(self, op: IROp, result: Optional[str] = None,
+             arg1: Optional[str] = None, arg2: Optional[str] = None,
+             extra: Optional[Any] = None):
+        if self.current_func is None:
+            return
+        self.current_func.instructions.append(IRInst(op, result, arg1, arg2, extra))
+
+    def generate(self) -> Dict[str, FunctionIR]:
+        for child in self.ast.children:
+            if child.type == ASTNodeType.FUNC_DEF:
+                self._generate_function(child)
+        return self.function_irs
+
+    def _generate_function(self, node: ASTNode):
+        func_name = node.value
+        self.temp_counter = 0
+        self.label_counter = 0
+        self.current_func = FunctionIR(name=func_name)
+        self.function_irs[func_name] = self.current_func
+
+        entry_label = self.new_label()
+        self.emit(IROp.LABEL, arg1=entry_label)
+
+        body = node.children[-1] if node.children else None
+        if body and body.type == ASTNodeType.BLOCK:
+            self._generate_block(body)
+
+        if not self.current_func.instructions or self.current_func.instructions[-1].op not in (IROp.RETURN, IROp.JUMP):
+            self.emit(IROp.RETURN)
+
+    def _generate_block(self, node: ASTNode):
+        for child in node.children:
+            self._generate_stmt(child)
+
+    def _generate_stmt(self, node: ASTNode):
+        if node is None:
+            return
+        t = node.type
+        if t == ASTNodeType.VAR_DECL:
+            self._generate_var_decl(node)
+        elif t == ASTNodeType.ARRAY_DECL:
+            pass
+        elif t == ASTNodeType.ASSIGN:
+            self._generate_assign(node)
+        elif t == ASTNodeType.IF:
+            self._generate_if(node)
+        elif t == ASTNodeType.WHILE:
+            self._generate_while(node)
+        elif t == ASTNodeType.FOR:
+            self._generate_for(node)
+        elif t == ASTNodeType.RETURN:
+            self._generate_return(node)
+        elif t == ASTNodeType.PRINT:
+            self._generate_print(node)
+        elif t == ASTNodeType.BLOCK:
+            self._generate_block(node)
+        elif t in (ASTNodeType.BINARY_OP, ASTNodeType.UNARY_OP,
+                   ASTNodeType.CALL, ASTNodeType.ARRAY_ACCESS,
+                   ASTNodeType.INT_LIT, ASTNodeType.FLOAT_LIT,
+                   ASTNodeType.BOOL_LIT, ASTNodeType.STRING_LIT,
+                   ASTNodeType.IDENTIFIER):
+            self._generate_expr(node)
+
+    def _generate_var_decl(self, node: ASTNode):
+        name = node.value
+        if node.children:
+            init_val = self._generate_expr(node.children[0])
+            self.emit(IROp.ASSIGN, result=name, arg1=init_val)
+
+    def _generate_assign(self, node: ASTNode):
+        target = node.children[0]
+        value = self._generate_expr(node.children[1])
+        if target.type == ASTNodeType.IDENTIFIER:
+            self.emit(IROp.ASSIGN, result=target.value, arg1=value)
+        elif target.type == ASTNodeType.ARRAY_ACCESS:
+            arr_name = target.children[0].value
+            idx = self._generate_expr(target.children[1])
+            self.emit(IROp.ARRAY_STORE, result=value, arg1=arr_name, arg2=idx)
+
+    def _generate_if(self, node: ASTNode):
+        cond = self._generate_expr(node.children[0])
+        then_label = self.new_label()
+        else_label = self.new_label()
+        end_label = self.new_label()
+
+        if len(node.children) > 2:
+            self.emit(IROp.JUMP_IF_NOT, arg1=cond, arg2=else_label)
+            self.emit(IROp.LABEL, arg1=then_label)
+            self._generate_stmt(node.children[1])
+            self.emit(IROp.JUMP, arg1=end_label)
+            self.emit(IROp.LABEL, arg1=else_label)
+            self._generate_stmt(node.children[2])
+        else:
+            self.emit(IROp.JUMP_IF_NOT, arg1=cond, arg2=end_label)
+            self.emit(IROp.LABEL, arg1=then_label)
+            self._generate_stmt(node.children[1])
+        self.emit(IROp.LABEL, arg1=end_label)
+
+    def _generate_while(self, node: ASTNode):
+        cond_label = self.new_label("W")
+        body_label = self.new_label("W")
+        end_label = self.new_label("W")
+
+        self.emit(IROp.LABEL, arg1=cond_label)
+        cond = self._generate_expr(node.children[0])
+        self.emit(IROp.JUMP_IF_NOT, arg1=cond, arg2=end_label)
+        self.emit(IROp.LABEL, arg1=body_label)
+        self._generate_stmt(node.children[1])
+        self.emit(IROp.JUMP, arg1=cond_label)
+        self.emit(IROp.LABEL, arg1=end_label)
+
+    def _generate_for(self, node: ASTNode):
+        init = node.children[0] if len(node.children) > 0 else None
+        cond = node.children[1] if len(node.children) > 1 else None
+        update = node.children[2] if len(node.children) > 2 else None
+        body = node.children[3] if len(node.children) > 3 else None
+
+        if init:
+            self._generate_stmt(init)
+
+        cond_label = self.new_label("F")
+        body_label = self.new_label("F")
+        end_label = self.new_label("F")
+
+        self.emit(IROp.LABEL, arg1=cond_label)
+        if cond:
+            cond_val = self._generate_expr(cond)
+            self.emit(IROp.JUMP_IF_NOT, arg1=cond_val, arg2=end_label)
+        self.emit(IROp.LABEL, arg1=body_label)
+        if body:
+            self._generate_stmt(body)
+        if update and update.children:
+            self._generate_stmt(update)
+        self.emit(IROp.JUMP, arg1=cond_label)
+        self.emit(IROp.LABEL, arg1=end_label)
+
+    def _generate_return(self, node: ASTNode):
+        if node.children:
+            val = self._generate_expr(node.children[0])
+            self.emit(IROp.RETURN, arg1=val)
+        else:
+            self.emit(IROp.RETURN)
+
+    def _generate_print(self, node: ASTNode):
+        if node.children:
+            val = self._generate_expr(node.children[0])
+            self.emit(IROp.PRINT, arg1=val)
+
+    def _generate_expr(self, node: ASTNode) -> str:
+        if node is None:
+            return ""
+        t = node.type
+
+        if t == ASTNodeType.INT_LIT:
+            temp = self.new_temp()
+            self.emit(IROp.ASSIGN, result=temp, arg1=str(node.value))
+            return temp
+        elif t == ASTNodeType.FLOAT_LIT:
+            temp = self.new_temp()
+            self.emit(IROp.ASSIGN, result=temp, arg1=str(node.value))
+            return temp
+        elif t == ASTNodeType.BOOL_LIT:
+            temp = self.new_temp()
+            self.emit(IROp.ASSIGN, result=temp, arg1="true" if node.value else "false")
+            return temp
+        elif t == ASTNodeType.STRING_LIT:
+            temp = self.new_temp()
+            self.emit(IROp.ASSIGN, result=temp, arg1=repr(node.value))
+            return temp
+        elif t == ASTNodeType.IDENTIFIER:
+            return node.value
+        elif t == ASTNodeType.BINARY_OP:
+            return self._generate_binary(node)
+        elif t == ASTNodeType.UNARY_OP:
+            return self._generate_unary(node)
+        elif t == ASTNodeType.CALL:
+            return self._generate_call(node)
+        elif t == ASTNodeType.ARRAY_ACCESS:
+            return self._generate_array_access(node)
+
+        return ""
+
+    def _generate_binary(self, node: ASTNode) -> str:
+        left = self._generate_expr(node.children[0])
+        right = self._generate_expr(node.children[1])
+        op = node.value
+        ir_op = self.BIN_OP_MAP.get(op)
+        if ir_op:
+            temp = self.new_temp()
+            self.emit(ir_op, result=temp, arg1=left, arg2=right)
+            return temp
+        return left
+
+    def _generate_unary(self, node: ASTNode) -> str:
+        operand = self._generate_expr(node.children[0])
+        op = node.value
+        if op == '!':
+            temp = self.new_temp()
+            self.emit(IROp.NOT, result=temp, arg1=operand)
+            return temp
+        elif op == '-':
+            temp = self.new_temp()
+            self.emit(IROp.NEG, result=temp, arg1=operand)
+            return temp
+        return operand
+
+    def _generate_call(self, node: ASTNode) -> str:
+        func_name = node.value
+        args = []
+        for arg in node.children:
+            arg_val = self._generate_expr(arg)
+            args.append(arg_val)
+            self.emit(IROp.PARAM, arg1=arg_val)
+        temp = self.new_temp()
+        self.emit(IROp.CALL, result=temp, arg1=func_name, extra=args)
+        return temp
+
+    def _generate_array_access(self, node: ASTNode) -> str:
+        arr_name = node.children[0].value
+        idx = self._generate_expr(node.children[1])
+        temp = self.new_temp()
+        self.emit(IROp.ARRAY_LOAD, result=temp, arg1=arr_name, arg2=idx)
+        return temp
+
+
+class CFGBuilder:
+    def build(self, func_ir: FunctionIR) -> List[BasicBlock]:
+        instructions = func_ir.instructions
+        if not instructions:
+            return []
+
+        leader_indices = self._find_leaders(instructions)
+        blocks = self._create_blocks(instructions, leader_indices)
+        self._build_edges(blocks, instructions, leader_indices)
+        return blocks
+
+    def _find_leaders(self, instructions: List[IRInst]) -> set:
+        leaders = {0}
+        for i, inst in enumerate(instructions):
+            if inst.op in (IROp.JUMP, IROp.JUMP_IF, IROp.JUMP_IF_NOT):
+                if i + 1 < len(instructions):
+                    leaders.add(i + 1)
+                label = inst.arg2 if inst.op in (IROp.JUMP_IF, IROp.JUMP_IF_NOT) else inst.arg1
+                for j, jn in enumerate(instructions):
+                    if jn.op == IROp.LABEL and jn.arg1 == label:
+                        leaders.add(j)
+                        break
+        return sorted(leaders)
+
+    def _create_blocks(self, instructions: List[IRInst], leader_indices: List[int]) -> List[BasicBlock]:
+        blocks = []
+        for i, start in enumerate(leader_indices):
+            end = leader_indices[i + 1] if i + 1 < len(leader_indices) else len(instructions)
+            block_insts = instructions[start:end]
+            label = block_insts[0].arg1 if block_insts and block_insts[0].op == IROp.LABEL else f"BLOCK_{i}"
+            bb = BasicBlock(id=i, label=label, instructions=block_insts)
+            blocks.append(bb)
+        return blocks
+
+    def _build_edges(self, blocks: List[BasicBlock], instructions: List[IRInst], leader_indices: List[int]):
+        label_to_block = {}
+        for bb in blocks:
+            if bb.instructions and bb.instructions[0].op == IROp.LABEL:
+                label_to_block[bb.instructions[0].arg1] = bb.id
+
+        for i, bb in enumerate(blocks):
+            last_inst = bb.instructions[-1] if bb.instructions else None
+            if last_inst is None:
+                continue
+
+            if last_inst.op == IROp.JUMP:
+                target_label = last_inst.arg1
+                target_id = label_to_block.get(target_label)
+                if target_id is not None:
+                    bb.successors.append(target_id)
+                    blocks[target_id].predecessors.append(bb.id)
+                    bb.jump_condition = "unconditional"
+            elif last_inst.op in (IROp.JUMP_IF, IROp.JUMP_IF_NOT):
+                target_label = last_inst.arg2
+                target_id = label_to_block.get(target_label)
+                cond = "true" if last_inst.op == IROp.JUMP_IF else "false"
+                bb.jump_condition = f"if {last_inst.arg1} is {cond}"
+                if target_id is not None:
+                    bb.successors.append(target_id)
+                    blocks[target_id].predecessors.append(bb.id)
+                if i + 1 < len(blocks):
+                    bb.successors.append(i + 1)
+                    blocks[i + 1].predecessors.append(bb.id)
+            elif last_inst.op == IROp.RETURN:
+                bb.jump_condition = "return"
+            else:
+                if i + 1 < len(blocks):
+                    bb.successors.append(i + 1)
+                    blocks[i + 1].predecessors.append(bb.id)
+                    bb.jump_condition = "fallthrough"
+
+
+class IROptimizer:
+    def optimize(self, func_ir: FunctionIR) -> Tuple[List[IRInst], List[BasicBlock]]:
+        insts = list(func_ir.instructions)
+        insts = self._constant_folding(insts)
+        insts = self._dead_code_elimination(insts)
+        insts = self._clean_unused_temps(insts)
+
+        temp_func = FunctionIR(name=func_ir.name, instructions=insts)
+        cfg_builder = CFGBuilder()
+        blocks = cfg_builder.build(temp_func)
+        return insts, blocks
+
+    def _constant_folding(self, insts: List[IRInst]) -> List[IRInst]:
+        const_map: Dict[str, Any] = {}
+        result = []
+
+        def is_const(val: str) -> bool:
+            if val in const_map:
+                return True
+            try:
+                float(val)
+                return True
+            except ValueError:
+                return val in ("true", "false") or (val.startswith('"') and val.endswith('"'))
+
+        def get_const(val: str) -> Any:
+            if val in const_map:
+                return const_map[val]
+            if val == "true":
+                return True
+            if val == "false":
+                return False
+            try:
+                if '.' in val:
+                    return float(val)
+                return int(val)
+            except ValueError:
+                if val.startswith('"') and val.endswith('"'):
+                    return val[1:-1]
+                return val
+
+        def to_str(val: Any) -> str:
+            if isinstance(val, bool):
+                return "true" if val else "false"
+            if isinstance(val, str) and not (val.startswith('"') and val.endswith('"')):
+                return repr(val)
+            return str(val)
+
+        arith_ops = {IROp.ADD, IROp.SUB, IROp.MUL, IROp.DIV, IROp.MOD}
+        cmp_ops = {IROp.EQ, IROp.NEQ, IROp.LT, IROp.GT, IROp.LE, IROp.GE}
+        logic_ops = {IROp.AND, IROp.OR}
+
+        for inst in insts:
+            if inst.op in arith_ops and inst.result and is_const(inst.arg1) and is_const(inst.arg2):
+                v1 = get_const(inst.arg1)
+                v2 = get_const(inst.arg2)
+                op_map = {IROp.ADD: lambda a, b: a + b, IROp.SUB: lambda a, b: a - b,
+                          IROp.MUL: lambda a, b: a * b, IROp.DIV: lambda a, b: a / b,
+                          IROp.MOD: lambda a, b: a % b}
+                try:
+                    folded = op_map[inst.op](v1, v2)
+                    const_map[inst.result] = folded
+                    result.append(IRInst(IROp.ASSIGN, result=inst.result, arg1=to_str(folded)))
+                    continue
+                except (TypeError, ZeroDivisionError):
+                    pass
+            elif inst.op in cmp_ops and inst.result and is_const(inst.arg1) and is_const(inst.arg2):
+                v1 = get_const(inst.arg1)
+                v2 = get_const(inst.arg2)
+                op_map = {IROp.EQ: lambda a, b: a == b, IROp.NEQ: lambda a, b: a != b,
+                          IROp.LT: lambda a, b: a < b, IROp.GT: lambda a, b: a > b,
+                          IROp.LE: lambda a, b: a <= b, IROp.GE: lambda a, b: a >= b}
+                try:
+                    folded = op_map[inst.op](v1, v2)
+                    const_map[inst.result] = folded
+                    result.append(IRInst(IROp.ASSIGN, result=inst.result, arg1=to_str(folded)))
+                    continue
+                except TypeError:
+                    pass
+            elif inst.op in logic_ops and inst.result and is_const(inst.arg1) and is_const(inst.arg2):
+                v1 = get_const(inst.arg1)
+                v2 = get_const(inst.arg2)
+                op_map = {IROp.AND: lambda a, b: a and b, IROp.OR: lambda a, b: a or b}
+                try:
+                    folded = op_map[inst.op](v1, v2)
+                    const_map[inst.result] = folded
+                    result.append(IRInst(IROp.ASSIGN, result=inst.result, arg1=to_str(folded)))
+                    continue
+                except TypeError:
+                    pass
+            elif inst.op == IROp.NOT and inst.result and is_const(inst.arg1):
+                v = get_const(inst.arg1)
+                if isinstance(v, bool):
+                    folded = not v
+                    const_map[inst.result] = folded
+                    result.append(IRInst(IROp.ASSIGN, result=inst.result, arg1=to_str(folded)))
+                    continue
+            elif inst.op == IROp.NEG and inst.result and is_const(inst.arg1):
+                v = get_const(inst.arg1)
+                if isinstance(v, (int, float)):
+                    folded = -v
+                    const_map[inst.result] = folded
+                    result.append(IRInst(IROp.ASSIGN, result=inst.result, arg1=to_str(folded)))
+                    continue
+            elif inst.op == IROp.ASSIGN and inst.result and is_const(inst.arg1):
+                const_map[inst.result] = get_const(inst.arg1)
+
+            new_inst = IRInst(inst.op, inst.result, inst.arg1, inst.arg2, inst.extra)
+            if new_inst.arg1 in const_map and new_inst.op not in (IROp.LABEL,):
+                new_inst.arg1 = to_str(const_map[new_inst.arg1])
+            if new_inst.arg2 in const_map:
+                new_inst.arg2 = to_str(const_map[new_inst.arg2])
+            if new_inst.extra and isinstance(new_inst.extra, list):
+                new_inst.extra = [to_str(const_map[a]) if a in const_map else a for a in new_inst.extra]
+            result.append(new_inst)
+        return result
+
+    def _dead_code_elimination(self, insts: List[IRInst]) -> List[IRInst]:
+        used = set()
+        for inst in insts:
+            if inst.op in (IROp.JUMP, IROp.JUMP_IF, IROp.JUMP_IF_NOT):
+                used.add(inst.arg1)
+            if inst.op in (IROp.JUMP_IF, IROp.JUMP_IF_NOT):
+                used.add(inst.arg2)
+            if inst.arg1 and inst.op not in (IROp.LABEL, IROp.ASSIGN):
+                used.add(inst.arg1)
+            if inst.arg2:
+                used.add(inst.arg2)
+            if inst.extra and isinstance(inst.extra, list):
+                for a in inst.extra:
+                    used.add(a)
+            if inst.op in (IROp.ARRAY_STORE, IROp.PRINT, IROp.RETURN, IROp.PARAM):
+                if inst.arg1:
+                    used.add(inst.arg1)
+                if inst.result and inst.op == IROp.ARRAY_STORE:
+                    used.add(inst.result)
+
+        result = []
+        for inst in insts:
+            if inst.op in (IROp.LABEL, IROp.JUMP, IROp.JUMP_IF, IROp.JUMP_IF_NOT,
+                           IROp.RETURN, IROp.PRINT, IROp.PARAM, IROp.ARRAY_STORE):
+                result.append(inst)
+            elif inst.result and inst.result in used:
+                result.append(inst)
+            elif inst.op == IROp.CALL:
+                result.append(inst)
+        return result
+
+    def _clean_unused_temps(self, insts: List[IRInst]) -> List[IRInst]:
+        used = set()
+        for inst in insts:
+            if inst.arg1 and not inst.arg1.startswith('t'):
+                used.add(inst.arg1)
+            if inst.arg2 and not inst.arg2.startswith('t'):
+                used.add(inst.arg2)
+            if inst.op not in (IROp.ASSIGN,) and inst.arg1:
+                used.add(inst.arg1)
+            if inst.arg2:
+                used.add(inst.arg2)
+            if inst.result and inst.op != IROp.ASSIGN:
+                used.add(inst.result)
+            if inst.extra and isinstance(inst.extra, list):
+                for a in inst.extra:
+                    used.add(a)
+            if inst.op in (IROp.PRINT, IROp.RETURN, IROp.PARAM, IROp.ARRAY_STORE):
+                if inst.arg1:
+                    used.add(inst.arg1)
+                if inst.result:
+                    used.add(inst.result)
+
+        for inst in insts:
+            if inst.result in used:
+                if inst.arg1:
+                    used.add(inst.arg1)
+                if inst.arg2:
+                    used.add(inst.arg2)
+
+        result = []
+        for inst in insts:
+            if inst.result and inst.result.startswith('t') and inst.result not in used:
+                if inst.op in (IROp.ASSIGN, IROp.ADD, IROp.SUB, IROp.MUL, IROp.DIV,
+                               IROp.MOD, IROp.EQ, IROp.NEQ, IROp.LT, IROp.GT,
+                               IROp.LE, IROp.GE, IROp.AND, IROp.OR,
+                               IROp.NOT, IROp.NEG, IROp.ARRAY_LOAD):
+                    continue
+            result.append(inst)
+        return result
+
+
 def format_token_table(tokens: List[Token]) -> str:
     header = f"{'No.':<5} {'Type':<12} {'Value':<20} {'Line':<6} {'Col':<5}"
     sep = "-" * len(header)
@@ -1465,6 +2101,62 @@ def format_symbol_table(checker: TypeChecker) -> str:
     return '\n'.join(lines)
 
 
+def format_ir(function_irs: Dict[str, FunctionIR], optimized: bool = False) -> str:
+    lines = []
+    for func_name, func_ir in function_irs.items():
+        lines.append("=" * 60)
+        lines.append(f"Function: {func_name}")
+        lines.append("=" * 60)
+        lines.append("")
+
+        insts = func_ir.optimized_instructions if (optimized and func_ir.optimized_instructions is not None) else func_ir.instructions
+        blocks = func_ir.optimized_basic_blocks if (optimized and func_ir.optimized_basic_blocks is not None) else func_ir.basic_blocks
+
+        if optimized:
+            lines.append("--- Optimized IR Instructions ---")
+        else:
+            lines.append("--- IR Instructions ---")
+        for i, inst in enumerate(insts):
+            lines.append(f"{i:4d}  {str(inst)}")
+        lines.append("")
+
+        lines.append("--- Basic Blocks ---")
+        for bb in blocks:
+            lines.append(f"Block {bb.id}: {bb.label}")
+            if bb.predecessors:
+                lines.append(f"  Predecessors: {bb.predecessors}")
+            else:
+                lines.append(f"  Predecessors: []")
+            if bb.successors:
+                lines.append(f"  Successors:   {bb.successors}")
+            else:
+                lines.append(f"  Successors:   []")
+            if bb.jump_condition:
+                lines.append(f"  Jump Cond:    {bb.jump_condition}")
+            lines.append(f"  Instructions:")
+            for inst in bb.instructions:
+                lines.append(f"    {str(inst)}")
+            lines.append("")
+    return '\n'.join(lines)
+
+
+def build_ir_with_cfg(ast: ASTNode, do_optimize: bool = False) -> Dict[str, FunctionIR]:
+    ir_gen = IRGenerator(ast)
+    function_irs = ir_gen.generate()
+
+    cfg_builder = CFGBuilder()
+    optimizer = IROptimizer()
+
+    for func_name, func_ir in function_irs.items():
+        func_ir.basic_blocks = cfg_builder.build(func_ir)
+        if do_optimize:
+            opt_insts, opt_blocks = optimizer.optimize(func_ir)
+            func_ir.optimized_instructions = opt_insts
+            func_ir.optimized_basic_blocks = opt_blocks
+
+    return function_irs
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="MiniCC - A simple compiler frontend CLI",
@@ -1473,11 +2165,14 @@ def main():
   lex SOURCE.mc       Run lexer and print token table
   parse SOURCE.mc     Run parser and print AST
   check SOURCE.mc     Run full pipeline (lexer+parser+type check) and print errors/symbol table
-  ast SOURCE.mc       Run full pipeline and print typed AST (--json for JSON format)""")
-    parser.add_argument('command', choices=['lex', 'parse', 'check', 'ast'],
+  ast SOURCE.mc       Run full pipeline and print typed AST (--json for JSON format)
+  ir SOURCE.mc        Generate 3-address IR and CFG after type checking
+                      Options: --json for JSON output, --opt to enable optimizations""")
+    parser.add_argument('command', choices=['lex', 'parse', 'check', 'ast', 'ir'],
                         help='Command to execute')
     parser.add_argument('source', help='Source file path')
-    parser.add_argument('--json', action='store_true', help='Output AST as JSON')
+    parser.add_argument('--json', action='store_true', help='Output as JSON')
+    parser.add_argument('--opt', action='store_true', help='Enable IR optimizations')
 
     args = parser.parse_args()
 
@@ -1522,14 +2217,17 @@ def main():
     checker = TypeChecker(ast)
     type_errors = checker.check()
 
+    all_errors = []
+    for pe in parse_errors:
+        all_errors.append(TypeCheckError(pe.message, pe.line, pe.col, "error"))
+    all_errors.extend(type_errors)
+    has_errors = any(e.severity == "error" for e in all_errors)
+    has_warnings = any(e.severity == "warning" for e in all_errors)
+
     if args.command == 'check':
         print("=" * 60)
         print("Type Check & Symbol Table")
         print("=" * 60)
-        all_errors = []
-        for pe in parse_errors:
-            all_errors.append(TypeCheckError(pe.message, pe.line, pe.col, "error"))
-        all_errors.extend(type_errors)
         errors_only = [e for e in all_errors if e.severity == "error"]
         warnings = [e for e in all_errors if e.severity == "warning"]
         if errors_only:
@@ -1543,11 +2241,6 @@ def main():
         sys.exit(1 if errors_only else 0)
 
     if args.command == 'ast':
-        all_errors = []
-        for pe in parse_errors:
-            all_errors.append(TypeCheckError(pe.message, pe.line, pe.col, "error"))
-        all_errors.extend(type_errors)
-
         if args.json:
             diagnostics = []
             for e in all_errors:
@@ -1560,8 +2253,8 @@ def main():
             output = {
                 "ast": ast.to_dict(),
                 "diagnostics": diagnostics,
-                "has_errors": any(e.severity == "error" for e in all_errors),
-                "has_warnings": any(e.severity == "warning" for e in all_errors),
+                "has_errors": has_errors,
+                "has_warnings": has_warnings,
             }
             print(json.dumps(output, indent=2, ensure_ascii=False))
         else:
@@ -1572,7 +2265,69 @@ def main():
             if all_errors:
                 print()
                 print(format_errors(all_errors, "Diagnostics"))
-        sys.exit(1 if any(e.severity == 'error' for e in all_errors) else 0)
+        sys.exit(1 if has_errors else 0)
+
+    if args.command == 'ir':
+        diagnostics = []
+        for e in all_errors:
+            diagnostics.append({
+                "severity": e.severity,
+                "message": e.message,
+                "line": e.line,
+                "col": e.col,
+            })
+
+        if has_errors:
+            if args.json:
+                output = {
+                    "diagnostics": diagnostics,
+                    "has_errors": True,
+                    "has_warnings": has_warnings,
+                    "functions": {},
+                }
+                print(json.dumps(output, indent=2, ensure_ascii=False))
+            else:
+                print("=" * 60)
+                print("IR Generation Failed")
+                print("=" * 60)
+                print(format_errors(all_errors, "Diagnostics"))
+                print("\nCannot generate IR due to errors above.")
+            sys.exit(1)
+
+        function_irs = build_ir_with_cfg(ast, do_optimize=args.opt)
+
+        if args.json:
+            functions_dict = {}
+            for fname, fir in function_irs.items():
+                functions_dict[fname] = fir.to_dict(optimized=args.opt)
+            output = {
+                "diagnostics": diagnostics,
+                "has_errors": False,
+                "has_warnings": has_warnings,
+                "functions": functions_dict,
+            }
+            print(json.dumps(output, indent=2, ensure_ascii=False))
+        else:
+            print("=" * 60)
+            title = "Intermediate Representation (IR) and Control Flow Graph"
+            if args.opt:
+                title += " (Optimized)"
+            print(title)
+            print("=" * 60)
+            if has_warnings:
+                warnings = [e for e in all_errors if e.severity == "warning"]
+                print(format_errors(warnings, "Warnings"))
+                print()
+            print(format_ir(function_irs, optimized=args.opt))
+            if args.opt:
+                print("=" * 60)
+                print("Optimization Summary")
+                print("=" * 60)
+                for fname, fir in function_irs.items():
+                    orig_count = len(fir.instructions)
+                    opt_count = len(fir.optimized_instructions) if fir.optimized_instructions else orig_count
+                    print(f"  Function {fname}: {orig_count} -> {opt_count} instructions (removed {orig_count - opt_count})")
+        sys.exit(0)
 
 
 if __name__ == '__main__':
