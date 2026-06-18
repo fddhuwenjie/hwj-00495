@@ -479,7 +479,26 @@ class FunctionIR:
     optimized_instructions: Optional[List[IRInst]] = None
     optimized_basic_blocks: Optional[List[BasicBlock]] = None
 
-    def to_dict(self, optimized: bool = False) -> Dict:
+    def to_dict(self, optimized: bool = False, compare: bool = False) -> Dict:
+        if compare and self.optimized_instructions is not None:
+            return {
+                "name": self.name,
+                "before": {
+                    "instructions": [inst.to_dict() for inst in self.instructions],
+                    "basic_blocks": [bb.to_dict() for bb in self.basic_blocks],
+                },
+                "after": {
+                    "instructions": [inst.to_dict() for inst in self.optimized_instructions],
+                    "basic_blocks": [bb.to_dict() for bb in self.optimized_basic_blocks] if self.optimized_basic_blocks else [],
+                },
+                "diff": {
+                    "instructions_before": len(self.instructions),
+                    "instructions_after": len(self.optimized_instructions),
+                    "instructions_removed": len(self.instructions) - len(self.optimized_instructions),
+                    "blocks_before": len(self.basic_blocks),
+                    "blocks_after": len(self.optimized_basic_blocks) if self.optimized_basic_blocks else 0,
+                }
+            }
         insts = self.optimized_instructions if (optimized and self.optimized_instructions is not None) else self.instructions
         blocks = self.optimized_basic_blocks if (optimized and self.optimized_basic_blocks is not None) else self.basic_blocks
         return {
@@ -2140,6 +2159,56 @@ def format_ir(function_irs: Dict[str, FunctionIR], optimized: bool = False) -> s
     return '\n'.join(lines)
 
 
+def format_ir_compare(function_irs: Dict[str, FunctionIR]) -> str:
+    lines = []
+    for func_name, func_ir in function_irs.items():
+        if func_ir.optimized_instructions is None:
+            continue
+
+        lines.append("=" * 80)
+        lines.append(f"Function: {func_name}  (Before vs After Optimization)")
+        lines.append("=" * 80)
+        lines.append("")
+
+        orig_insts = func_ir.instructions
+        opt_insts = func_ir.optimized_instructions
+        orig_count = len(orig_insts)
+        opt_count = len(opt_insts)
+        removed = orig_count - opt_count
+
+        lines.append(f"Instruction count: {orig_count} -> {opt_count} (removed {removed}, {int(removed/orig_count*100) if orig_count > 0 else 0}%)")
+        lines.append("")
+
+        col_width = 38
+        lines.append(f"{'Before':<{col_width}} | {'After':<{col_width}}")
+        lines.append("-" * col_width + "-+-" + "-" * col_width)
+
+        orig_idx = 0
+        opt_idx = 0
+        max_lines = max(orig_count, opt_count)
+        for i in range(max_lines):
+            orig_str = ""
+            opt_str = ""
+            if orig_idx < orig_count:
+                orig_str = str(orig_insts[orig_idx])
+                orig_idx += 1
+            if opt_idx < opt_count:
+                opt_str = str(opt_insts[opt_idx])
+                opt_idx += 1
+            orig_disp = (f"{i:3d} {orig_str}")[:col_width]
+            opt_disp = (f"{i:3d} {opt_str}")[:col_width]
+            marker = " " if orig_str == opt_str else "Δ"
+            lines.append(f"{orig_disp:<{col_width}} {marker} {opt_disp:<{col_width}}")
+
+        lines.append("")
+        lines.append("--- Basic Blocks Comparison ---")
+        lines.append(f"  Before: {len(func_ir.basic_blocks)} blocks")
+        if func_ir.optimized_basic_blocks:
+            lines.append(f"  After:  {len(func_ir.optimized_basic_blocks)} blocks")
+        lines.append("")
+    return '\n'.join(lines)
+
+
 def build_ir_with_cfg(ast: ASTNode, do_optimize: bool = False) -> Dict[str, FunctionIR]:
     ir_gen = IRGenerator(ast)
     function_irs = ir_gen.generate()
@@ -2299,7 +2368,10 @@ def main():
         if args.json:
             functions_dict = {}
             for fname, fir in function_irs.items():
-                functions_dict[fname] = fir.to_dict(optimized=args.opt)
+                if args.opt:
+                    functions_dict[fname] = fir.to_dict(compare=True)
+                else:
+                    functions_dict[fname] = fir.to_dict(optimized=False)
             output = {
                 "diagnostics": diagnostics,
                 "has_errors": False,
@@ -2308,25 +2380,34 @@ def main():
             }
             print(json.dumps(output, indent=2, ensure_ascii=False))
         else:
-            print("=" * 60)
-            title = "Intermediate Representation (IR) and Control Flow Graph"
-            if args.opt:
-                title += " (Optimized)"
-            print(title)
-            print("=" * 60)
             if has_warnings:
                 warnings = [e for e in all_errors if e.severity == "warning"]
                 print(format_errors(warnings, "Warnings"))
                 print()
-            print(format_ir(function_irs, optimized=args.opt))
+
             if args.opt:
-                print("=" * 60)
+                print("=" * 80)
+                print("IR Optimization: Before vs After Comparison")
+                print("=" * 80)
+                print()
+                print(format_ir_compare(function_irs))
+                print("=" * 80)
                 print("Optimization Summary")
-                print("=" * 60)
+                print("=" * 80)
+                total_orig = 0
+                total_opt = 0
                 for fname, fir in function_irs.items():
                     orig_count = len(fir.instructions)
                     opt_count = len(fir.optimized_instructions) if fir.optimized_instructions else orig_count
-                    print(f"  Function {fname}: {orig_count} -> {opt_count} instructions (removed {orig_count - opt_count})")
+                    total_orig += orig_count
+                    total_opt += opt_count
+                    print(f"  {fname:30s} {orig_count:4d} -> {opt_count:4d} instructions  (removed {orig_count - opt_count:3d}, {int((orig_count-opt_count)/orig_count*100) if orig_count > 0 else 0}%)")
+                print(f"  {'TOTAL':30s} {total_orig:4d} -> {total_opt:4d} instructions  (removed {total_orig - total_opt:3d}, {int((total_orig-total_opt)/total_orig*100) if total_orig > 0 else 0}%)")
+            else:
+                print("=" * 60)
+                print("Intermediate Representation (IR) and Control Flow Graph")
+                print("=" * 60)
+                print(format_ir(function_irs, optimized=False))
         sys.exit(0)
 
 
